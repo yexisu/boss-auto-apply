@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS自动投递助手（无AI）
 // @namespace    local.boss.auto.apply
-// @version      1.2.5
+// @version      1.2.6
 // @description  BOSS直聘自动投递：接口投递、自动下滑加载、屏蔽词、过滤不活跃Boss；不含AI、不连接第三方服务。
 // @author       local
 // @match        https://www.zhipin.com/web/geek/*
@@ -34,7 +34,7 @@
   };
 
   const defaultSettings = {
-    greeting: '您好，我对这个岗位很感兴趣，方便的话可以进一步沟通一下。',
+    greeting: '您好，我看到贵司{company}正在招聘{title}，岗位方向和我的经历比较匹配，希望能有机会进一步沟通。',
     maxApply: 30,
     intervalSeconds: 4,
     autoSendGreeting: true,
@@ -544,8 +544,22 @@
     }
   };
 
+  const buildGreeting = (job) => {
+    const fallbackTitle = job.title && job.title !== '未知职位' ? job.title : '这个岗位';
+    const variables = {
+      title: fallbackTitle,
+      job: fallbackTitle,
+      company: job.company || '贵司',
+      salary: job.salary || '',
+      area: job.area || '',
+    };
+    const template = safeText(settings.greeting) || defaultSettings.greeting;
+    const message = template.replace(/\{(title|job|company|salary|area)\}/g, (_, key) => variables[key] || '');
+    return safeText(message).replace(/贵司贵司/g, '贵司');
+  };
+
   const sendGreeting = async (job) => {
-    const greeting = safeText(settings.greeting);
+    const greeting = buildGreeting(job);
     if (!settings.autoSendGreeting || !greeting) return { skipped: true, reason: '未启用招呼语' };
 
     const bossData = await fetchBossData(job);
@@ -563,11 +577,11 @@
     const socketConnect = getSocketConnect();
     if (socketConnect?.sendMessage) {
       socketConnect.sendMessage(user, greeting, 'text');
-      return { sent: true, mode: 'sendMessage' };
+      return { sent: true, mode: 'sendMessage', greeting };
     }
     if (socketConnect?.sendTextMessage) {
       socketConnect.sendTextMessage(user, greeting);
-      return { sent: true, mode: 'sendTextMessage' };
+      return { sent: true, mode: 'sendTextMessage', greeting };
     }
 
     throw new Error('页面聊天SDK不可用，无法发送招呼语');
@@ -715,7 +729,7 @@
         try {
           const result = await sendGreeting(job);
           if (!isCurrentRun()) break;
-          if (result?.sent) log(`招呼语已发送：${formatJob(job)}`, 'success');
+          if (result?.sent) log(`招呼语已发送：${formatJob(job)}｜${result.greeting}`, 'success');
         } catch (error) {
           log(`招呼语发送失败：${error.message}`, 'warn');
         }
@@ -870,7 +884,7 @@
         <div id="boss-auto-apply-status" class="boss-auto-status">已下滑 0 次｜捕获 0｜成功 0/30｜失败 0｜跳过 0</div>
         <div class="boss-auto-card">
           <div class="boss-auto-card-title">投递设置</div>
-          <textarea id="boss-auto-apply-greeting" placeholder="投递成功后发送的固定招呼语"></textarea>
+          <textarea id="boss-auto-apply-greeting" placeholder="投递成功后发送的招呼语模板。支持变量：{company}公司、{title}岗位、{salary}薪资、{area}地区"></textarea>
           <textarea id="boss-auto-apply-block-keywords" placeholder="屏蔽词：命中公司名/职位名/地区等就跳过，支持换行、逗号、空格分隔。例如：外包 培训 销售 某某公司"></textarea>
           <textarea id="boss-auto-apply-foreign-keywords" placeholder="外企关键词：开启只投外企后，命中这些词才投递。用逗号分隔，例如：外企,欧美,Global,APAC,世界500强"></textarea>
           <div class="boss-auto-inline-actions"><button id="boss-auto-apply-reset-foreign" class="boss-auto-link-button" type="button">恢复默认外企关键词</button></div>
@@ -881,12 +895,12 @@
             <div class="boss-auto-field"><label>间隔秒</label><input id="boss-auto-apply-interval" type="number" min="1" max="60"></div>
           </div>
           <div class="boss-auto-switches">
-            <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-auto-greeting" type="checkbox"><span class="boss-auto-switch-ui"></span><span>发送招呼语</span></label>
+            <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-auto-greeting" type="checkbox"><span class="boss-auto-switch-ui"></span><span>智能招呼语</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-only-foreign" type="checkbox"><span class="boss-auto-switch-ui"></span><span>只投外企</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-block-outsource" type="checkbox"><span class="boss-auto-switch-ui"></span><span>外包拦截</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-only-active" type="checkbox"><span class="boss-auto-switch-ui"></span><span>过滤不活跃Boss</span></label>
           </div>
-          <div class="boss-auto-tip">开启“外包拦截”后，会用外包名单匹配公司/岗位信息并跳过；开启“只投外企”后，未命中外企关键词会跳过；开启“过滤不活跃Boss”后，活跃度未知会跳过。</div>
+          <div class="boss-auto-tip">招呼语会按岗位自动替换 {company}/{title}/{salary}/{area}；开启“外包拦截”后会用外包名单匹配并跳过；开启“只投外企”后，未命中外企关键词会跳过。</div>
         </div>
         <div class="boss-auto-card">
           <div class="boss-auto-actions">
