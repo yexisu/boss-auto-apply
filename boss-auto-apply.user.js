@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS自动投递助手（无AI）
 // @namespace    local.boss.auto.apply
-// @version      1.2.1
+// @version      1.2.5
 // @description  BOSS直聘自动投递：接口投递、自动下滑加载、屏蔽词、过滤不活跃Boss；不含AI、不连接第三方服务。
 // @author       local
 // @match        https://www.zhipin.com/web/geek/*
@@ -15,6 +15,7 @@
 
   const STORAGE_KEY = 'boss_auto_apply_settings_v1';
   const END_REASONS = /上限|频繁|验证|安全|今日沟通人数|请稍后|风控|异常流量|登录/;
+  const CONTACTED_REASONS = /继续沟通|已沟通|沟通过|已打招呼|已投递|已经.*沟通|已经.*打招呼/;
   const JOB_API_HINT = /\/wapi\/zpgeek\/search\/joblist|\/wapi\/zpgeek\/recommend|\/wapi\/zpgeek\/job\/rec|\/wapi\/zpgeek\/job\/card|\/web\/geek\/job/i;
 
   const state = {
@@ -39,7 +40,93 @@
     autoSendGreeting: true,
     blockKeywords: '',
     onlyForeignCompany: false,
-    foreignKeywords: '外企\n欧美\n美国\n欧洲\n德国\n法国\n英国\n瑞士\n瑞典\n荷兰\n丹麦\n芬兰\n挪威\n日本\n韩国\n新加坡\n跨国公司\n世界500强\nFortune\nNASDAQ\nNYSE\n纳斯达克\n纽交所\n外资\n合资\n独资\n代表处\n办事处\n中国区\n亚太\nAPAC\nMNC\nGlobal\nInternational',
+    foreignKeywords: '外企,欧美,美国,欧洲,德国,法国,英国,瑞士,瑞典,荷兰,丹麦,芬兰,挪威,日本,韩国,新加坡,跨国公司,世界500强,Fortune,NASDAQ,NYSE,纳斯达克,纽交所,外资,合资,独资,代表处,办事处,中国区,亚太,APAC,MNC,Global,International',
+    blockOutsourceCompany: false,
+    outsourceKeywords: [
+      '中软国际',
+      '中科创达',
+      '博彦科技',
+      '软通动力',
+      '文思海辉',
+      '东软',
+      '上海思芮',
+      '科瑞',
+      '高伟达',
+      '中智',
+      '外服',
+      '中企人力',
+      '易才',
+      '蚂蚁HR',
+      '紫川软件',
+      '易思博',
+      '麦亚信',
+      '长亮',
+      '京北方',
+      '微创',
+      '鼎驰',
+      '拓保软件',
+      '武汉佰钧成',
+      '佰钧成',
+      '博悦科创',
+      '亿科达',
+      '青柏信息',
+      '博雅互动',
+      '博奥特科技',
+      '金证股份',
+      '印孚瑟斯',
+      'Infosys',
+      '前海泰坦科技',
+      '福瑞兰斯',
+      'SapFreelance',
+      '凌志软件',
+      '法本信息',
+      '柯莱特',
+      '中科软',
+      '浪潮软件',
+      '亚信科技',
+      '新致软件',
+      'IBM外包',
+      '北京外企德科',
+      '外企德科',
+      'FESCO Adecco',
+      '德科信息',
+      '海隆软件',
+      '宇信科技',
+      '汉德',
+      '汉得',
+      '科蓝',
+      '亿迪',
+      '海博拓天',
+      '神马',
+      '博朗',
+      '中和软件',
+      '亿达',
+      '凯捷',
+      'Capgemini',
+      '埃森哲',
+      'Accenture',
+      '普华永道信息技术',
+      '信必优',
+      '润和',
+      '神州数码',
+      '信华信',
+      '大连华信',
+      '中电文思海辉',
+      '中电金信',
+      '项目外包',
+      '人力外包',
+      '软件外包',
+      '外包',
+      '外派',
+      '驻场',
+      '驻场开发',
+      '劳务派遣',
+      '派遣',
+      'OD',
+      'ODC',
+      'ITO',
+      'BPO',
+    ].join(','),
     onlyActiveBoss: false,
     panelLeft: null,
     panelTop: null,
@@ -69,17 +156,12 @@
     .map((item) => item.trim())
     .filter(Boolean);
 
+  const formatKeywords = (value) => parseKeywords(value).join(',');
+
   const blockHit = (job) => {
     const keywords = parseKeywords(settings.blockKeywords);
     if (!keywords.length) return null;
-    const rawText = (() => {
-      try {
-        return JSON.stringify(job.raw || {});
-      } catch (_) {
-        return '';
-      }
-    })();
-    const target = [job.company, job.title, job.salary, job.area, rawText].filter(Boolean).join(' ').toLowerCase();
+    const target = jobSearchText(job);
     return keywords.find((keyword) => target.includes(keyword.toLowerCase())) || null;
   };
 
@@ -102,6 +184,14 @@
     return keywords.find((keyword) => target.includes(keyword.toLowerCase())) || null;
   };
 
+  const outsourceCompanyHit = (job) => {
+    if (!settings.blockOutsourceCompany) return null;
+    const keywords = parseKeywords(settings.outsourceKeywords);
+    if (!keywords.length) return null;
+    const target = jobSearchText(job);
+    return keywords.find((keyword) => target.includes(keyword.toLowerCase())) || null;
+  };
+
   const getCookie = (name) => {
     const escapedName = name.replace(/[.$?*|{}()[\]\\/+^]/g, '\\$&');
     const match = document.cookie.match(new RegExp(`(?:^|; )${escapedName}=([^;]*)`));
@@ -111,7 +201,7 @@
   const safeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
   const ACTIVE_FIELD_PATTERN = /active|online|lastlogin|lastactive|bossactive|bossonline|活跃|在线/i;
-  const ACTIVE_TEXT_PATTERN = /(刚刚在线|当前在线|在线|刚刚活跃|今日活跃|今天活跃|近期活跃|最近活跃|\d+\s*(?:秒|分钟|小时|天|日|周|月|年)(?:前|内)?(?:活跃|在线)?|[一二三四五六七八九十两]+\s*(?:秒|分钟|小时|天|日|周|月|年)(?:前|内)?(?:活跃|在线)?|不活跃|很久未活跃|本周活跃|本月活跃)/;
+  const ACTIVE_TEXT_PATTERN = /(不在线|离线|不活跃|很久未活跃|刚刚在线|当前在线|在线|刚刚活跃|今日活跃|今天活跃|近期活跃|最近活跃|\d+\s*(?:秒|分钟|小时|天|日|周|月|年)(?:前|内)?(?:活跃|在线)?|[一二三四五六七八九十两]+\s*(?:秒|分钟|小时|天|日|周|月|年)(?:前|内)?(?:活跃|在线)?|本周活跃|本月活跃)/;
 
   const extractActiveTextFromRaw = (raw) => {
     let found = '';
@@ -190,7 +280,8 @@
       raw.actionText,
     ].filter(Boolean).join(' '));
     const friendStatus = Number(raw.friendStatus ?? raw.chatStatus ?? raw.relationStatus ?? 0);
-    const contacted = raw.contact === true || friendStatus === 1 || /继续沟通|已沟通|沟通过/.test(safeText(raw.statusText || raw.actionText || raw.btnText || ''));
+    const contactedText = safeText([raw.statusText, raw.actionText, raw.btnText, raw.buttonText, raw.chatText].filter(Boolean).join(' '));
+    const contacted = raw.contact === true || friendStatus === 1 || CONTACTED_REASONS.test(contactedText);
     const activeText = extractActiveTextFromRaw(raw);
 
     if (!securityId || !encryptJobId || !lid) return null;
@@ -213,6 +304,33 @@
     };
   };
 
+  const storeJob = (job) => {
+    if (!job?.key) return false;
+    const existing = state.capturedJobs.get(job.key);
+    if (!existing) {
+      state.capturedJobs.set(job.key, job);
+      return true;
+    }
+
+    state.capturedJobs.set(job.key, {
+      ...existing,
+      ...job,
+      securityId: job.securityId || existing.securityId,
+      encryptJobId: job.encryptJobId || existing.encryptJobId,
+      lid: job.lid || existing.lid,
+      encryptBossId: job.encryptBossId || existing.encryptBossId,
+      title: job.title && job.title !== '未知职位' ? job.title : existing.title,
+      company: job.company || existing.company,
+      salary: job.salary || existing.salary,
+      area: job.area || existing.area,
+      contacted: existing.contacted || job.contacted,
+      extraText: [existing.extraText, job.extraText].filter(Boolean).join(' '),
+      activeText: job.activeText || existing.activeText,
+      raw: { ...(existing.raw || {}), ...(job.raw || {}) },
+    });
+    return false;
+  };
+
   const visitObject = (value, visitor, depth = 0, seen = new WeakSet()) => {
     if (!value || typeof value !== 'object' || depth > 8) return;
     if (seen.has(value)) return;
@@ -232,8 +350,7 @@
     visitObject(payload, (array) => {
       array.forEach((item) => {
         const job = normalizeJob(item, source);
-        if (job && !state.capturedJobs.has(job.key)) {
-          state.capturedJobs.set(job.key, job);
+        if (job && storeJob(job)) {
           count += 1;
         }
       });
@@ -336,8 +453,7 @@
     let added = 0;
     [...new Set(elements)].forEach((element) => {
       const job = normalizeJob(readVueData(element), 'dom-vue') || parseJobFromLink(element);
-      if (job && !state.capturedJobs.has(job.key)) {
-        state.capturedJobs.set(job.key, job);
+      if (job && storeJob(job)) {
         added += 1;
       }
     });
@@ -354,7 +470,7 @@
     const normalized = safeText(text);
     if (!normalized) return null;
 
-    if (/不活跃|很久|前天|昨日|昨天|本周|本月|周前|月前|年前|天前|日前/.test(normalized)) return false;
+    if (/不活跃|不在线|离线|很久|前天|昨日|昨天|本周|本月|周前|月前|年前|天前|日前/.test(normalized)) return false;
     if (/([4-9]|[1-9]\d+)\s*[天日]内/.test(normalized)) return false;
     if (/刚刚|在线|当前|今日|今天|秒前|分钟前|小时前|[1-3]\s*[天日]内|[一二三]\s*[天日]内|近期活跃|最近活跃/.test(normalized)) return true;
     if (/活跃/.test(normalized) && !/周|月|年|天前|日前|昨日|昨天|前天/.test(normalized)) return true;
@@ -459,7 +575,7 @@
 
   const scrollForMoreJobs = async (shouldContinue = () => state.running) => {
     const beforeSize = state.capturedJobs.size;
-    const beforeY = window.scrollY;
+    let lastY = window.scrollY;
 
     for (let index = 0; index < 5; index += 1) {
       if (!shouldContinue()) return false;
@@ -471,7 +587,8 @@
       const hasPending = [...state.capturedJobs.values()].some((job) => !state.processedKeys.has(job.key));
       if (hasPending) return true;
       if (state.capturedJobs.size > beforeSize) return true;
-      if (Math.abs(window.scrollY - beforeY) < 10 && index > 1) break;
+      if (Math.abs(window.scrollY - lastY) < 10 && index > 1) break;
+      lastY = window.scrollY;
     }
 
     return false;
@@ -538,6 +655,8 @@
         continue;
       }
 
+      state.emptyScrollBatches = 0;
+
       state.processedKeys.add(job.key);
 
       const blockedKeyword = blockHit(job);
@@ -545,7 +664,14 @@
         state.skipped += 1;
         log(`跳过屏蔽词【${blockedKeyword}】：${formatJob(job)}`, 'warn');
         updateStatus();
-        await scrollForMoreJobs(isCurrentRun);
+        continue;
+      }
+
+      const outsourceKeyword = outsourceCompanyHit(job);
+      if (outsourceKeyword) {
+        state.skipped += 1;
+        log(`跳过外包公司/外包岗位【${outsourceKeyword}】：${formatJob(job)}`, 'warn');
+        updateStatus();
         continue;
       }
 
@@ -554,7 +680,6 @@
         state.skipped += 1;
         log(`跳过非外企/未命中外企关键词：${formatJob(job)}`, 'warn');
         updateStatus();
-        await scrollForMoreJobs(isCurrentRun);
         continue;
       }
       if (foreignKeyword) {
@@ -565,7 +690,6 @@
         state.skipped += 1;
         log(`跳过已打招呼/已沟通，继续向下查找：${formatJob(job)}`, 'warn');
         updateStatus();
-        await scrollForMoreJobs(isCurrentRun);
         continue;
       }
 
@@ -576,7 +700,6 @@
           state.skipped += 1;
           log(`跳过不活跃Boss【${activeResult.text}】：${formatJob(job)}`, 'warn');
           updateStatus();
-          await scrollForMoreJobs(isCurrentRun);
           continue;
         }
         log(`Boss近期活跃【${activeResult.text}】：${formatJob(job)}`, 'info');
@@ -597,6 +720,12 @@
           log(`招呼语发送失败：${error.message}`, 'warn');
         }
       } catch (error) {
+        if (CONTACTED_REASONS.test(error.message)) {
+          state.skipped += 1;
+          log(`投递返回已打招呼/已沟通，已跳过：${formatJob(job)}；原因：${error.message}`, 'warn');
+          updateStatus();
+          continue;
+        }
         state.failed += 1;
         log(`投递失败：${formatJob(job)}；原因：${error.message}`, 'error');
         if (END_REASONS.test(error.message)) {
@@ -646,6 +775,8 @@
     const blockKeywords = document.querySelector('#boss-auto-apply-block-keywords');
     const onlyForeignCompany = document.querySelector('#boss-auto-apply-only-foreign');
     const foreignKeywords = document.querySelector('#boss-auto-apply-foreign-keywords');
+    const blockOutsourceCompany = document.querySelector('#boss-auto-apply-block-outsource');
+    const outsourceKeywords = document.querySelector('#boss-auto-apply-outsource-keywords');
     const onlyActiveBoss = document.querySelector('#boss-auto-apply-only-active');
 
     settings.greeting = greeting?.value || defaultSettings.greeting;
@@ -654,7 +785,9 @@
     settings.autoSendGreeting = autoGreeting?.checked !== false;
     settings.blockKeywords = blockKeywords?.value || '';
     settings.onlyForeignCompany = onlyForeignCompany?.checked === true;
-    settings.foreignKeywords = foreignKeywords?.value || defaultSettings.foreignKeywords;
+    settings.foreignKeywords = formatKeywords(foreignKeywords?.value || defaultSettings.foreignKeywords);
+    settings.blockOutsourceCompany = blockOutsourceCompany?.checked === true;
+    settings.outsourceKeywords = formatKeywords(outsourceKeywords?.value || defaultSettings.outsourceKeywords);
     settings.onlyActiveBoss = onlyActiveBoss?.checked === true;
     saveSettings();
     updateStatus();
@@ -665,7 +798,7 @@
 
     const style = document.createElement('style');
     style.textContent = `
-      #boss-auto-apply-panel { position: fixed; right: 22px; top: 88px; z-index: 2147483647; width: 372px; max-height: min(78vh, 760px); display: flex; flex-direction: column; border-radius: 20px; background: rgba(255,255,255,.97); backdrop-filter: blur(14px); border: 1px solid rgba(0,179,138,.18); box-shadow: 0 18px 48px rgba(15,23,42,.18); color: #1f2933; font-size: 14px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif; overflow: hidden; transition: width .16s ease, box-shadow .16s ease, transform .16s ease; }
+      #boss-auto-apply-panel { position: fixed; right: 22px; top: 72px; z-index: 2147483647; width: 520px; max-height: min(88vh, 900px); display: flex; flex-direction: column; border-radius: 20px; background: rgba(255,255,255,.97); backdrop-filter: blur(14px); border: 1px solid rgba(0,179,138,.18); box-shadow: 0 18px 48px rgba(15,23,42,.18); color: #1f2933; font-size: 14px; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif; overflow: hidden; transition: width .16s ease, box-shadow .16s ease, transform .16s ease; }
       #boss-auto-apply-panel * { box-sizing: border-box; }
       #boss-auto-apply-panel.is-dragging { transition: none; box-shadow: 0 22px 58px rgba(15,23,42,.24); }
       #boss-auto-apply-panel.is-collapsed { width: 218px; max-height: none; border-radius: 999px; }
@@ -680,11 +813,11 @@
       #boss-auto-apply-panel .boss-auto-subtitle { margin-top: 3px; color: #7a8794; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       #boss-auto-apply-panel .boss-auto-head-actions { display: flex; align-items: center; gap: 8px; }
       #boss-auto-apply-panel .boss-auto-collapse { width: 30px; height: 30px; border: 0; border-radius: 9px; background: #e8f8f3; color: #087f5b; cursor: pointer; font-weight: 800; }
-      #boss-auto-apply-panel .boss-auto-body { padding: 12px; overflow: auto; }
+      #boss-auto-apply-panel .boss-auto-body { padding: 14px; overflow: auto; }
       #boss-auto-apply-panel .boss-auto-status { color: #0f766e; background: #e8f8f3; border: 1px solid #c6eee2; border-radius: 999px; padding: 7px 10px; margin-bottom: 12px; font-size: 12px; line-height: 1.35; }
       #boss-auto-apply-panel .boss-auto-card { background: #fff; border: 1px solid #edf2f7; border-radius: 14px; padding: 11px; margin-bottom: 10px; }
       #boss-auto-apply-panel .boss-auto-card-title { margin: 0 0 9px; font-weight: 800; color: #26323f; }
-      #boss-auto-apply-panel textarea { width: 100%; min-height: 72px; resize: vertical; padding: 9px 10px; border: 1px solid #d9e2ec; border-radius: 10px; outline: none; line-height: 1.5; background: #fff; color: #1f2933; transition: border-color .15s, box-shadow .15s; }
+      #boss-auto-apply-panel textarea { width: 100%; min-height: 96px; resize: vertical; padding: 10px 11px; border: 1px solid #d9e2ec; border-radius: 10px; outline: none; line-height: 1.55; background: #fff; color: #1f2933; transition: border-color .15s, box-shadow .15s; }
       #boss-auto-apply-panel textarea + textarea { margin-top: 8px; }
       #boss-auto-apply-panel textarea:focus, #boss-auto-apply-panel input:focus { border-color: #00b38a; box-shadow: 0 0 0 3px rgba(0,179,138,.12); }
       #boss-auto-apply-panel .boss-auto-inline-actions { display: flex; justify-content: flex-end; margin-top: 7px; }
@@ -694,7 +827,7 @@
       #boss-auto-apply-panel .boss-auto-controls-two { grid-template-columns: repeat(2, 1fr); }
       #boss-auto-apply-panel .boss-auto-field label { display: block; margin-bottom: 5px; color: #66788a; font-size: 12px; }
       #boss-auto-apply-panel input[type="number"] { width: 100%; padding: 8px 9px; border: 1px solid #d9e2ec; border-radius: 10px; outline: none; background: #fff; }
-      #boss-auto-apply-panel .boss-auto-switches { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+      #boss-auto-apply-panel .boss-auto-switches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
       #boss-auto-apply-panel .boss-auto-check { min-height: 38px; padding: 0 10px; border: 1px solid #d9e2ec; border-radius: 12px; background: #fbfdff; color: #405261; }
       #boss-auto-apply-panel .boss-auto-switch { position: relative; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
       #boss-auto-apply-panel .boss-auto-switch input { position: absolute; opacity: 0; pointer-events: none; }
@@ -709,7 +842,7 @@
       #boss-auto-apply-toggle.running { background: #e5484d; box-shadow: 0 5px 14px rgba(229,72,77,.22); }
       #boss-auto-apply-scan { background: #3b82f6; box-shadow: 0 5px 14px rgba(59,130,246,.2); }
       #boss-auto-apply-toggle:hover, #boss-auto-apply-scan:hover, #boss-auto-apply-panel .boss-auto-collapse:hover { transform: translateY(-1px); }
-      #boss-auto-apply-log { height: 190px; overflow: auto; padding: 9px; border: 1px solid #edf2f7; border-radius: 11px; background: #fbfdff; }
+      #boss-auto-apply-log { height: 260px; overflow: auto; padding: 10px; border: 1px solid #edf2f7; border-radius: 11px; background: #fbfdff; }
       .boss-auto-apply-log-item { margin: 0 0 7px; line-height: 1.45; word-break: break-word; color: #405261; }
       .boss-auto-apply-log-item.success { color: #087f5b; }
       .boss-auto-apply-log-item.warn { color: #b7791f; }
@@ -726,7 +859,7 @@
           <span class="boss-auto-logo">投</span>
           <div>
             <h3>BOSS 自动投递助手</h3>
-            <div class="boss-auto-subtitle">拖动悬浮 · 屏蔽词 · 活跃Boss过滤</div>
+            <div class="boss-auto-subtitle">拖动悬浮 · 屏蔽词 · 外包拦截 · 活跃Boss过滤</div>
           </div>
         </div>
         <div class="boss-auto-head-actions">
@@ -739,8 +872,10 @@
           <div class="boss-auto-card-title">投递设置</div>
           <textarea id="boss-auto-apply-greeting" placeholder="投递成功后发送的固定招呼语"></textarea>
           <textarea id="boss-auto-apply-block-keywords" placeholder="屏蔽词：命中公司名/职位名/地区等就跳过，支持换行、逗号、空格分隔。例如：外包 培训 销售 某某公司"></textarea>
-          <textarea id="boss-auto-apply-foreign-keywords" placeholder="外企关键词：开启只投外企后，命中这些词才投递。可按公司标签补充，例如：外企 欧美 Global APAC 世界500强"></textarea>
+          <textarea id="boss-auto-apply-foreign-keywords" placeholder="外企关键词：开启只投外企后，命中这些词才投递。用逗号分隔，例如：外企,欧美,Global,APAC,世界500强"></textarea>
           <div class="boss-auto-inline-actions"><button id="boss-auto-apply-reset-foreign" class="boss-auto-link-button" type="button">恢复默认外企关键词</button></div>
+          <textarea id="boss-auto-apply-outsource-keywords" placeholder="外包拦截名单：开启外包拦截后，命中公司名/岗位信息就跳过。用逗号分隔，例如：中软国际,软通动力,文思海辉"></textarea>
+          <div class="boss-auto-inline-actions"><button id="boss-auto-apply-reset-outsource" class="boss-auto-link-button" type="button">恢复默认外包名单</button></div>
           <div class="boss-auto-controls boss-auto-controls-two">
             <div class="boss-auto-field"><label>最大投递数</label><input id="boss-auto-apply-max" type="number" min="1" max="200"></div>
             <div class="boss-auto-field"><label>间隔秒</label><input id="boss-auto-apply-interval" type="number" min="1" max="60"></div>
@@ -748,9 +883,10 @@
           <div class="boss-auto-switches">
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-auto-greeting" type="checkbox"><span class="boss-auto-switch-ui"></span><span>发送招呼语</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-only-foreign" type="checkbox"><span class="boss-auto-switch-ui"></span><span>只投外企</span></label>
+            <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-block-outsource" type="checkbox"><span class="boss-auto-switch-ui"></span><span>外包拦截</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-only-active" type="checkbox"><span class="boss-auto-switch-ui"></span><span>过滤不活跃Boss</span></label>
           </div>
-          <div class="boss-auto-tip">开启“只投外企”后，会用外企关键词匹配公司标签/职位卡片；开启“过滤不活跃Boss”后，活跃度未知会跳过。</div>
+          <div class="boss-auto-tip">开启“外包拦截”后，会用外包名单匹配公司/岗位信息并跳过；开启“只投外企”后，未命中外企关键词会跳过；开启“过滤不活跃Boss”后，活跃度未知会跳过。</div>
         </div>
         <div class="boss-auto-card">
           <div class="boss-auto-actions">
@@ -769,11 +905,13 @@
 
     panel.querySelector('#boss-auto-apply-greeting').value = settings.greeting;
     panel.querySelector('#boss-auto-apply-block-keywords').value = settings.blockKeywords || '';
-    panel.querySelector('#boss-auto-apply-foreign-keywords').value = settings.foreignKeywords || defaultSettings.foreignKeywords;
+    panel.querySelector('#boss-auto-apply-foreign-keywords').value = formatKeywords(settings.foreignKeywords || defaultSettings.foreignKeywords);
+    panel.querySelector('#boss-auto-apply-outsource-keywords').value = formatKeywords(settings.outsourceKeywords || defaultSettings.outsourceKeywords);
     panel.querySelector('#boss-auto-apply-max').value = settings.maxApply;
     panel.querySelector('#boss-auto-apply-interval').value = settings.intervalSeconds;
     panel.querySelector('#boss-auto-apply-auto-greeting').checked = settings.autoSendGreeting;
     panel.querySelector('#boss-auto-apply-only-foreign').checked = settings.onlyForeignCompany === true;
+    panel.querySelector('#boss-auto-apply-block-outsource').checked = settings.blockOutsourceCompany === true;
     panel.querySelector('#boss-auto-apply-only-active').checked = settings.onlyActiveBoss === true;
 
     const collapseButton = panel.querySelector('#boss-auto-apply-collapse');
@@ -804,14 +942,18 @@
     const applySavedPosition = () => {
       const savedLeft = Number(settings.panelLeft);
       const savedTop = Number(settings.panelTop);
-      if (Number.isFinite(savedLeft) && Number.isFinite(savedTop)) {
+      const hasSavedPosition = settings.panelLeft != null
+        && settings.panelTop != null
+        && Number.isFinite(savedLeft)
+        && Number.isFinite(savedTop);
+      if (hasSavedPosition) {
         panel.style.left = `${savedLeft}px`;
         panel.style.top = `${savedTop}px`;
         panel.style.right = 'auto';
       } else {
         const rect = panel.getBoundingClientRect();
         panel.style.left = `${Math.max(8, window.innerWidth - rect.width - 22)}px`;
-        panel.style.top = '88px';
+        panel.style.top = '72px';
         panel.style.right = 'auto';
       }
       clampPanelPosition(false);
@@ -864,11 +1006,20 @@
 
     panel.querySelectorAll('textarea,input').forEach((input) => input.addEventListener('change', syncSettingsFromPanel));
     panel.querySelector('#boss-auto-apply-reset-foreign').addEventListener('click', () => {
+      syncSettingsFromPanel();
       const foreignKeywords = panel.querySelector('#boss-auto-apply-foreign-keywords');
-      foreignKeywords.value = defaultSettings.foreignKeywords;
-      settings.foreignKeywords = defaultSettings.foreignKeywords;
+      foreignKeywords.value = formatKeywords(defaultSettings.foreignKeywords);
+      settings.foreignKeywords = formatKeywords(defaultSettings.foreignKeywords);
       saveSettings();
       log('已恢复默认外企关键词。', 'success');
+    });
+    panel.querySelector('#boss-auto-apply-reset-outsource').addEventListener('click', () => {
+      syncSettingsFromPanel();
+      const outsourceKeywords = panel.querySelector('#boss-auto-apply-outsource-keywords');
+      outsourceKeywords.value = formatKeywords(defaultSettings.outsourceKeywords);
+      settings.outsourceKeywords = formatKeywords(defaultSettings.outsourceKeywords);
+      saveSettings();
+      log('已恢复默认外包拦截名单。', 'success');
     });
     collapseButton.addEventListener('click', toggleCollapse);
     header.addEventListener('dblclick', (event) => {
