@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS自动投递助手（无AI）
 // @namespace    local.boss.auto.apply
-// @version      1.2.6
-// @description  BOSS直聘自动投递：接口投递、自动下滑加载、屏蔽词、过滤不活跃Boss；不含AI、不连接第三方服务。
+// @version      1.2.9
+// @description  BOSS直聘自动投递：接口投递、自动下滑加载、外包拦截、过滤不活跃Boss；不含AI、不连接第三方服务。
 // @author       local
 // @match        https://www.zhipin.com/web/geek/*
 // @match        https://www.zhipin.com/overseas/*
@@ -14,8 +14,13 @@
   'use strict';
 
   const STORAGE_KEY = 'boss_auto_apply_settings_v1';
+  const CONTACT_HISTORY_KEY = 'boss_auto_apply_contact_history_v1';
+  const CONTACT_HISTORY_MAX = 3000;
+  const CONTACT_HISTORY_TTL = 1000 * 60 * 60 * 24 * 180;
   const END_REASONS = /上限|频繁|验证|安全|今日沟通人数|请稍后|风控|异常流量|登录/;
   const CONTACTED_REASONS = /继续沟通|已沟通|沟通过|已打招呼|已投递|已经.*沟通|已经.*打招呼/;
+  const CONTACTED_BOOLEAN_FIELD_PATTERN = /^(?:is|has)?(?:friend|contact|contacted|communicated|greeted|greeting|conversation|chat)$/i;
+  const CONTACTED_STATUS_FIELD_PATTERN = /(?:friend|contact|chat|relation|greet|\u6c9f\u901a|\u804a\u5929|\u4f1a\u8bdd|\u597d\u53cb|\u6253\u62db\u547c).*status|status.*(?:friend|contact|chat|relation|greet|\u6c9f\u901a|\u804a\u5929|\u4f1a\u8bdd|\u597d\u53cb|\u6253\u62db\u547c)/i;
   const JOB_API_HINT = /\/wapi\/zpgeek\/search\/joblist|\/wapi\/zpgeek\/recommend|\/wapi\/zpgeek\/job\/rec|\/wapi\/zpgeek\/job\/card|\/web\/geek\/job/i;
 
   const state = {
@@ -38,7 +43,6 @@
     maxApply: 30,
     intervalSeconds: 4,
     autoSendGreeting: true,
-    blockKeywords: '',
     onlyForeignCompany: false,
     foreignKeywords: '外企,欧美,美国,欧洲,德国,法国,英国,瑞士,瑞典,荷兰,丹麦,芬兰,挪威,日本,韩国,新加坡,跨国公司,世界500强,Fortune,NASDAQ,NYSE,纳斯达克,纽交所,外资,合资,独资,代表处,办事处,中国区,亚太,APAC,MNC,Global,International',
     blockOutsourceCompany: false,
@@ -128,6 +132,8 @@
       'BPO',
     ].join(','),
     onlyActiveBoss: false,
+    activeBossDays: 3,
+    skipPreviouslyContacted: true,
     panelLeft: null,
     panelTop: null,
     panelCollapsed: false,
@@ -157,13 +163,6 @@
     .filter(Boolean);
 
   const formatKeywords = (value) => parseKeywords(value).join(',');
-
-  const blockHit = (job) => {
-    const keywords = parseKeywords(settings.blockKeywords);
-    if (!keywords.length) return null;
-    const target = jobSearchText(job);
-    return keywords.find((keyword) => target.includes(keyword.toLowerCase())) || null;
-  };
 
   const jobSearchText = (job) => {
     const rawText = (() => {
@@ -199,6 +198,107 @@
   };
 
   const safeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+
+  const loadContactHistory = () => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(CONTACT_HISTORY_KEY) || '{}');
+      const now = Date.now();
+      const entries = Object.entries(raw || {})
+        .filter(([, record]) => record && Number.isFinite(Number(record.time)) && now - Number(record.time) <= CONTACT_HISTORY_TTL)
+        .sort((a, b) => Number(b[1].time) - Number(a[1].time))
+        .slice(0, CONTACT_HISTORY_MAX);
+      return new Map(entries);
+    } catch (_) {
+      return new Map();
+    }
+  };
+
+  const contactHistory = loadContactHistory();
+
+  const saveContactHistory = () => {
+    try {
+      const entries = [...contactHistory.entries()]
+        .sort((a, b) => Number(b[1].time) - Number(a[1].time))
+        .slice(0, CONTACT_HISTORY_MAX);
+      contactHistory.clear();
+      entries.forEach(([key, record]) => contactHistory.set(key, record));
+      localStorage.setItem(CONTACT_HISTORY_KEY, JSON.stringify(Object.fromEntries(entries)));
+    } catch (_) {}
+  };
+
+  const historyPart = (value) => safeText(value).toLowerCase();
+
+  const contactHistoryKeys = (job) => {
+    const keys = new Set();
+    if (job.encryptJobId) keys.add(`job:${job.encryptJobId}`);
+    if (job.securityId && job.encryptJobId) keys.add(`security-job:${job.securityId}:${job.encryptJobId}`);
+    if (job.encryptBossId && job.encryptJobId) keys.add(`boss-job:${job.encryptBossId}:${job.encryptJobId}`);
+    if (job.company && job.title && job.encryptBossId) {
+      keys.add(`boss-title:${job.encryptBossId}:${historyPart(job.company)}:${historyPart(job.title)}`);
+    }
+    return [...keys];
+  };
+
+  const findContactHistory = (job) => contactHistoryKeys(job)
+    .map((key) => ({ key, record: contactHistory.get(key) }))
+    .find((item) => item.record) || null;
+
+  const rememberContactedJob = (job, reason = '\u5df2\u6c9f\u901a') => {
+    const keys = contactHistoryKeys(job);
+    if (!keys.length) return;
+    const record = {
+      time: Date.now(),
+      reason: safeText(reason),
+      title: job.title || '',
+      company: job.company || '',
+      boss: job.encryptBossId || '',
+      job: job.encryptJobId || '',
+    };
+    keys.forEach((key) => contactHistory.set(key, record));
+    saveContactHistory();
+  };
+
+  const clearContactHistory = () => {
+    contactHistory.clear();
+    try {
+      localStorage.removeItem(CONTACT_HISTORY_KEY);
+    } catch (_) {}
+  };
+
+  const extractContactedSignal = (raw) => {
+    let found = '';
+    const seen = new WeakSet();
+
+    const visit = (value, depth = 0, key = '') => {
+      if (found || value == null || depth > 6) return;
+      if (typeof value === 'string' || typeof value === 'number') {
+        const text = safeText(value);
+        if (text && CONTACTED_REASONS.test(text)) {
+          found = text;
+          return;
+        }
+        if (Number(value) === 1 && CONTACTED_STATUS_FIELD_PATTERN.test(key)) {
+          found = `${key}=1`;
+        }
+        return;
+      }
+      if (typeof value === 'boolean') {
+        if (value === true && CONTACTED_BOOLEAN_FIELD_PATTERN.test(key)) found = `${key}=true`;
+        return;
+      }
+      if (typeof value !== 'object' || seen.has(value)) return;
+      seen.add(value);
+
+      Object.entries(value).some(([childKey, childValue]) => {
+        visit(childValue, depth + 1, childKey);
+        return Boolean(found);
+      });
+    };
+
+    visit(raw);
+    return found;
+  };
 
   const ACTIVE_FIELD_PATTERN = /active|online|lastlogin|lastactive|bossactive|bossonline|活跃|在线/i;
   const ACTIVE_TEXT_PATTERN = /(不在线|离线|不活跃|很久未活跃|刚刚在线|当前在线|在线|刚刚活跃|今日活跃|今天活跃|近期活跃|最近活跃|\d+\s*(?:秒|分钟|小时|天|日|周|月|年)(?:前|内)?(?:活跃|在线)?|[一二三四五六七八九十两]+\s*(?:秒|分钟|小时|天|日|周|月|年)(?:前|内)?(?:活跃|在线)?|本周活跃|本月活跃)/;
@@ -256,7 +356,7 @@
     const securityId = raw.securityId || raw.security_id || raw.secId || raw.jobSecurityId || '';
     const encryptJobId = raw.encryptJobId || raw.encryptJobID || raw.jobId || raw.encryptId || raw.encryptJobid || '';
     const lid = raw.lid || raw.listId || raw.traceId || raw.jobLid || '';
-    const encryptBossId = raw.encryptBossId || raw.encryptBossID || raw.bossId || raw.encryptUid || raw.encryptUserId || '';
+    const encryptBossId = raw.encryptBossId || raw.encryptBossID || raw.bossId || raw.encryptUid || raw.encryptUserId || raw.bossEncryptId || '';
     const title = safeText(raw.jobName || raw.jobTitle || raw.positionName || raw.title || raw.name || raw.encryptJobId || encryptJobId || '未知职位');
     const company = safeText(raw.brandName || raw.companyName || raw.encryptBrandId || raw.brand || raw.company || '');
     const salary = safeText(raw.salaryDesc || raw.salary || '');
@@ -281,7 +381,8 @@
     ].filter(Boolean).join(' '));
     const friendStatus = Number(raw.friendStatus ?? raw.chatStatus ?? raw.relationStatus ?? 0);
     const contactedText = safeText([raw.statusText, raw.actionText, raw.btnText, raw.buttonText, raw.chatText].filter(Boolean).join(' '));
-    const contacted = raw.contact === true || friendStatus === 1 || CONTACTED_REASONS.test(contactedText);
+    const contactedSignal = extractContactedSignal(raw);
+    const contacted = raw.contact === true || friendStatus === 1 || CONTACTED_REASONS.test(contactedText) || Boolean(contactedSignal);
     const activeText = extractActiveTextFromRaw(raw);
 
     if (!securityId || !encryptJobId || !lid) return null;
@@ -298,6 +399,7 @@
       area,
       extraText,
       contacted,
+      contactedText: contactedSignal || contactedText,
       activeText,
       source,
       raw,
@@ -324,6 +426,7 @@
       salary: job.salary || existing.salary,
       area: job.area || existing.area,
       contacted: existing.contacted || job.contacted,
+      contactedText: job.contactedText || existing.contactedText,
       extraText: [existing.extraText, job.extraText].filter(Boolean).join(' '),
       activeText: job.activeText || existing.activeText,
       raw: { ...(existing.raw || {}), ...(job.raw || {}) },
@@ -466,14 +569,75 @@
     return [...state.capturedJobs.values()];
   };
 
+  const chineseNumberValue = (value) => {
+    const text = safeText(value);
+    if (!text) return null;
+    if (text === '\u534a') return 0.5;
+    const digits = {
+      '\u4e00': 1,
+      '\u4e8c': 2,
+      '\u4e24': 2,
+      '\u4e09': 3,
+      '\u56db': 4,
+      '\u4e94': 5,
+      '\u516d': 6,
+      '\u4e03': 7,
+      '\u516b': 8,
+      '\u4e5d': 9,
+    };
+    if (digits[text] != null) return digits[text];
+    if (text === '\u5341') return 10;
+    const match = text.match(/^([\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d])?\u5341([\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d])?$/);
+    if (match) return (digits[match[1]] || 1) * 10 + (digits[match[2]] || 0);
+    return null;
+  };
+
+  const activeThresholdDays = () => {
+    const value = Number(settings.activeBossDays);
+    const fallback = Number(defaultSettings.activeBossDays) || 3;
+    return Math.max(0, Math.min(365, Number.isFinite(value) ? value : fallback));
+  };
+
+  const durationToDays = (amount, unit) => {
+    const value = Number(amount);
+    if (!Number.isFinite(value)) return null;
+    if (/\u79d2|\u5206\u949f|\u5c0f\u65f6/.test(unit)) return 0;
+    if (/\u5929|\u65e5/.test(unit)) return value;
+    if (/\u5468/.test(unit)) return value * 7;
+    if (/\u6708/.test(unit)) return value * 30;
+    if (/\u5e74/.test(unit)) return value * 365;
+    return null;
+  };
+
+  const extractActiveDays = (text) => {
+    const normalized = safeText(text);
+    if (!normalized) return null;
+    if (/\u521a\u521a|\u5728\u7ebf|\u5f53\u524d|\u4eca\u65e5|\u4eca\u5929|\u79d2\u524d|\u5206\u949f\u524d|\u5c0f\u65f6\u524d/.test(normalized)) return 0;
+    if (/\u6628\u65e5|\u6628\u5929/.test(normalized)) return 1;
+    if (/\u524d\u5929/.test(normalized)) return 2;
+    if (/\u672c\u5468/.test(normalized)) return 7;
+    if (/\u672c\u6708/.test(normalized)) return 30;
+
+    const numberMatch = normalized.match(/(\d+(?:\.\d+)?)\s*(\u79d2|\u5206\u949f|\u5c0f\u65f6|\u5929|\u65e5|\u5468|\u6708|\u5e74)(?:\u524d|\u5185)?/);
+    if (numberMatch) return durationToDays(numberMatch[1], numberMatch[2]);
+
+    const chineseMatch = normalized.match(/([\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u534a]+)\s*(\u79d2|\u5206\u949f|\u5c0f\u65f6|\u5929|\u65e5|\u5468|\u6708|\u5e74)(?:\u524d|\u5185)?/);
+    if (chineseMatch) return durationToDays(chineseNumberValue(chineseMatch[1]), chineseMatch[2]);
+
+    return null;
+  };
+
   const isActiveText = (text) => {
     const normalized = safeText(text);
     if (!normalized) return null;
 
-    if (/不活跃|不在线|离线|很久|前天|昨日|昨天|本周|本月|周前|月前|年前|天前|日前/.test(normalized)) return false;
-    if (/([4-9]|[1-9]\d+)\s*[天日]内/.test(normalized)) return false;
-    if (/刚刚|在线|当前|今日|今天|秒前|分钟前|小时前|[1-3]\s*[天日]内|[一二三]\s*[天日]内|近期活跃|最近活跃/.test(normalized)) return true;
-    if (/活跃/.test(normalized) && !/周|月|年|天前|日前|昨日|昨天|前天/.test(normalized)) return true;
+    if (/\u4e0d\u6d3b\u8dc3|\u4e0d\u5728\u7ebf|\u79bb\u7ebf|\u5f88\u4e45/.test(normalized)) return false;
+    if (/\u8fd1\u671f\u6d3b\u8dc3|\u6700\u8fd1\u6d3b\u8dc3/.test(normalized)) return true;
+
+    const days = extractActiveDays(normalized);
+    if (days !== null) return days <= activeThresholdDays();
+
+    if (/\u6d3b\u8dc3/.test(normalized) && !/\u5468|\u6708|\u5e74|\u524d/.test(normalized)) return true;
     return null;
   };
 
@@ -536,6 +700,93 @@
     return json.zpData?.data || json.zpData || json.data;
   };
 
+  const mergeJobContactDetail = (job, detail) => {
+    if (!detail || typeof detail !== 'object') return '';
+    const normalized = normalizeJob({ ...(job.raw || {}), ...detail }, 'detail-contact-check');
+    if (normalized) {
+      job.encryptBossId = job.encryptBossId || normalized.encryptBossId;
+      job.contacted = job.contacted || normalized.contacted;
+      job.contactedText = normalized.contactedText || job.contactedText;
+      job.raw = { ...(job.raw || {}), ...(normalized.raw || {}) };
+      storeJob(job);
+    }
+    return extractContactedSignal(detail);
+  };
+
+  const assignBossIdentity = (job, bossData) => {
+    const encryptBossId = bossData?.encryptBossId || bossData?.encryptUid || bossData?.encryptFriendId || '';
+    if (encryptBossId && !job.encryptBossId) job.encryptBossId = String(encryptBossId);
+    if (job.raw && encryptBossId && !job.raw.encryptBossId) job.raw.encryptBossId = String(encryptBossId);
+  };
+
+  const hasJobChatEvidence = (job, data) => {
+    const text = (() => {
+      try {
+        return JSON.stringify(data || {});
+      } catch (_) {
+        return '';
+      }
+    })();
+    if (!text) return false;
+    if (job.encryptJobId && text.includes(job.encryptJobId)) return true;
+    if (job.securityId && text.includes(job.securityId)) return true;
+    if (job.title && job.title !== '\u672a\u77e5\u804c\u4f4d' && text.includes(job.title)) return true;
+    return false;
+  };
+
+  const checkPreviouslyContacted = async (job) => {
+    if (!settings.skipPreviouslyContacted) return { contacted: false };
+
+    const history = findContactHistory(job);
+    if (history) {
+      return { contacted: true, reason: history.record.reason || '\u672c\u5730\u5386\u53f2\u8bb0\u5f55', source: 'local' };
+    }
+
+    if (job.contacted) {
+      const reason = job.contactedText || '\u5c97\u4f4d\u5217\u8868\u663e\u793a\u5df2\u6c9f\u901a';
+      rememberContactedJob(job, reason);
+      return { contacted: true, reason, source: 'list' };
+    }
+
+    const rawSignal = extractContactedSignal(job.raw);
+    if (rawSignal) {
+      rememberContactedJob(job, rawSignal);
+      return { contacted: true, reason: rawSignal, source: 'raw' };
+    }
+
+    if (!job.encryptBossId && !job.raw?.encryptBossId) {
+      try {
+        const detail = await fetchJobDetail(job);
+        const detailSignal = mergeJobContactDetail(job, detail);
+        if (detailSignal) {
+          rememberContactedJob(job, detailSignal);
+          return { contacted: true, reason: detailSignal, source: 'detail' };
+        }
+      } catch (_) {}
+    }
+
+    if (!job.encryptBossId && !job.raw?.encryptBossId) return { contacted: false };
+
+    try {
+      const bossData = await fetchBossData(job);
+      assignBossIdentity(job, bossData);
+      const bossSignal = extractContactedSignal(bossData);
+      const hasEvidence = hasJobChatEvidence(job, bossData);
+      if (bossSignal && hasEvidence) {
+        rememberContactedJob(job, bossSignal);
+        return { contacted: true, reason: bossSignal, source: 'chat' };
+      }
+      if (bossSignal && CONTACTED_REASONS.test(bossSignal)) {
+        rememberContactedJob(job, bossSignal);
+        return { contacted: true, reason: bossSignal, source: 'chat' };
+      }
+    } catch (error) {
+      return { contacted: false, warning: error.message };
+    }
+
+    return { contacted: false };
+  };
+
   const getSocketConnect = () => {
     try {
       return window.GeekChatCore?.getInstance?.()?.socketConnect;
@@ -563,6 +814,7 @@
     if (!settings.autoSendGreeting || !greeting) return { skipped: true, reason: '未启用招呼语' };
 
     const bossData = await fetchBossData(job);
+    assignBossIdentity(job, bossData);
     const user = {
       uid: Number(bossData.bossId || bossData.uid || bossData.friendId),
       friendSource: Number(bossData.friendSource || bossData.source || 0),
@@ -673,14 +925,6 @@
 
       state.processedKeys.add(job.key);
 
-      const blockedKeyword = blockHit(job);
-      if (blockedKeyword) {
-        state.skipped += 1;
-        log(`跳过屏蔽词【${blockedKeyword}】：${formatJob(job)}`, 'warn');
-        updateStatus();
-        continue;
-      }
-
       const outsourceKeyword = outsourceCompanyHit(job);
       if (outsourceKeyword) {
         state.skipped += 1;
@@ -700,11 +944,16 @@
         log(`命中外企关键词【${foreignKeyword}】：${formatJob(job)}`, 'info');
       }
 
-      if (job.contacted) {
+      const contactedResult = await checkPreviouslyContacted(job);
+      if (!isCurrentRun()) break;
+      if (contactedResult.contacted) {
         state.skipped += 1;
-        log(`跳过已打招呼/已沟通，继续向下查找：${formatJob(job)}`, 'warn');
+        log(`\u8df3\u8fc7\u5386\u53f2\u5df2\u6c9f\u901a\u3010${contactedResult.reason}\u3011\uff1a${formatJob(job)}`, 'warn');
         updateStatus();
         continue;
+      }
+      if (contactedResult.warning) {
+        log(`\u5386\u53f2\u6c9f\u901a\u68c0\u67e5\u5931\u8d25\uff0c\u7ee7\u7eed\u5c1d\u8bd5\u6295\u9012\uff1a${contactedResult.warning}`, 'warn');
       }
 
       if (settings.onlyActiveBoss) {
@@ -723,6 +972,7 @@
         log(`投递中：${formatJob(job)}`, 'info');
         await applyJob(job);
         if (!isCurrentRun()) break;
+        rememberContactedJob(job, '\u6295\u9012\u6210\u529f');
         state.success += 1;
         log(`投递成功：${formatJob(job)}`, 'success');
 
@@ -736,6 +986,7 @@
       } catch (error) {
         if (CONTACTED_REASONS.test(error.message)) {
           state.skipped += 1;
+          rememberContactedJob(job, error.message);
           log(`投递返回已打招呼/已沟通，已跳过：${formatJob(job)}；原因：${error.message}`, 'warn');
           updateStatus();
           continue;
@@ -781,28 +1032,42 @@
     }
   };
 
+  const updateActiveDaysInputState = () => {
+    const onlyActiveBoss = document.querySelector('#boss-auto-apply-only-active');
+    const activeBossDays = document.querySelector('#boss-auto-apply-active-days');
+    if (!activeBossDays) return;
+    const disabled = onlyActiveBoss?.checked !== true;
+    activeBossDays.disabled = disabled;
+    activeBossDays.closest('.boss-auto-field')?.classList.toggle('is-disabled', disabled);
+    activeBossDays.title = disabled ? '\u5f00\u542f\u8fc7\u6ee4\u4e0d\u6d3b\u8dc3Boss\u540e\u53ef\u7f16\u8f91' : '';
+  };
+
   const syncSettingsFromPanel = () => {
     const greeting = document.querySelector('#boss-auto-apply-greeting');
     const maxApply = document.querySelector('#boss-auto-apply-max');
     const interval = document.querySelector('#boss-auto-apply-interval');
     const autoGreeting = document.querySelector('#boss-auto-apply-auto-greeting');
-    const blockKeywords = document.querySelector('#boss-auto-apply-block-keywords');
     const onlyForeignCompany = document.querySelector('#boss-auto-apply-only-foreign');
     const foreignKeywords = document.querySelector('#boss-auto-apply-foreign-keywords');
     const blockOutsourceCompany = document.querySelector('#boss-auto-apply-block-outsource');
     const outsourceKeywords = document.querySelector('#boss-auto-apply-outsource-keywords');
     const onlyActiveBoss = document.querySelector('#boss-auto-apply-only-active');
+    const activeBossDays = document.querySelector('#boss-auto-apply-active-days');
+    const skipPreviouslyContacted = document.querySelector('#boss-auto-apply-skip-contacted');
 
     settings.greeting = greeting?.value || defaultSettings.greeting;
     settings.maxApply = Math.max(1, Math.min(200, Number(maxApply?.value) || defaultSettings.maxApply));
     settings.intervalSeconds = Math.max(1, Math.min(60, Number(interval?.value) || defaultSettings.intervalSeconds));
+    const activeBossDaysValue = Number(activeBossDays?.value);
     settings.autoSendGreeting = autoGreeting?.checked !== false;
-    settings.blockKeywords = blockKeywords?.value || '';
     settings.onlyForeignCompany = onlyForeignCompany?.checked === true;
     settings.foreignKeywords = formatKeywords(foreignKeywords?.value || defaultSettings.foreignKeywords);
     settings.blockOutsourceCompany = blockOutsourceCompany?.checked === true;
     settings.outsourceKeywords = formatKeywords(outsourceKeywords?.value || defaultSettings.outsourceKeywords);
     settings.onlyActiveBoss = onlyActiveBoss?.checked === true;
+    settings.activeBossDays = Number.isFinite(activeBossDaysValue) ? Math.max(0, Math.min(365, activeBossDaysValue)) : defaultSettings.activeBossDays;
+    updateActiveDaysInputState();
+    settings.skipPreviouslyContacted = skipPreviouslyContacted?.checked !== false;
     saveSettings();
     updateStatus();
   };
@@ -841,6 +1106,8 @@
       #boss-auto-apply-panel .boss-auto-controls-two { grid-template-columns: repeat(2, 1fr); }
       #boss-auto-apply-panel .boss-auto-field label { display: block; margin-bottom: 5px; color: #66788a; font-size: 12px; }
       #boss-auto-apply-panel input[type="number"] { width: 100%; padding: 8px 9px; border: 1px solid #d9e2ec; border-radius: 10px; outline: none; background: #fff; }
+      #boss-auto-apply-panel .boss-auto-field.is-disabled label { color: #a0aec0; }
+      #boss-auto-apply-panel .boss-auto-field.is-disabled input { background: #f1f5f9; color: #94a3b8; cursor: not-allowed; border-color: #e2e8f0; }
       #boss-auto-apply-panel .boss-auto-switches { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
       #boss-auto-apply-panel .boss-auto-check { min-height: 38px; padding: 0 10px; border: 1px solid #d9e2ec; border-radius: 12px; background: #fbfdff; color: #405261; }
       #boss-auto-apply-panel .boss-auto-switch { position: relative; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
@@ -851,11 +1118,12 @@
       #boss-auto-apply-panel .boss-auto-switch input:checked + .boss-auto-switch-ui::after { transform: translateX(16px); }
       #boss-auto-apply-panel .boss-auto-tip { margin-top: 7px; color: #7a8794; font-size: 12px; line-height: 1.45; }
       #boss-auto-apply-panel .boss-auto-actions { display: flex; gap: 9px; }
-      #boss-auto-apply-toggle, #boss-auto-apply-scan { border: 0; border-radius: 11px; padding: 10px 14px; color: #fff; cursor: pointer; font-weight: 800; transition: transform .12s, box-shadow .12s, background .12s; }
+      #boss-auto-apply-toggle, #boss-auto-apply-scan, #boss-auto-apply-clear-history { border: 0; border-radius: 11px; padding: 10px 14px; color: #fff; cursor: pointer; font-weight: 800; transition: transform .12s, box-shadow .12s, background .12s; }
       #boss-auto-apply-toggle { flex: 1; background: #00b38a; box-shadow: 0 5px 14px rgba(0,179,138,.22); }
       #boss-auto-apply-toggle.running { background: #e5484d; box-shadow: 0 5px 14px rgba(229,72,77,.22); }
       #boss-auto-apply-scan { background: #3b82f6; box-shadow: 0 5px 14px rgba(59,130,246,.2); }
-      #boss-auto-apply-toggle:hover, #boss-auto-apply-scan:hover, #boss-auto-apply-panel .boss-auto-collapse:hover { transform: translateY(-1px); }
+      #boss-auto-apply-clear-history { background: #64748b; box-shadow: 0 5px 14px rgba(100,116,139,.18); }
+      #boss-auto-apply-toggle:hover, #boss-auto-apply-scan:hover, #boss-auto-apply-clear-history:hover, #boss-auto-apply-panel .boss-auto-collapse:hover { transform: translateY(-1px); }
       #boss-auto-apply-log { height: 260px; overflow: auto; padding: 10px; border: 1px solid #edf2f7; border-radius: 11px; background: #fbfdff; }
       .boss-auto-apply-log-item { margin: 0 0 7px; line-height: 1.45; word-break: break-word; color: #405261; }
       .boss-auto-apply-log-item.success { color: #087f5b; }
@@ -873,7 +1141,7 @@
           <span class="boss-auto-logo">投</span>
           <div>
             <h3>BOSS 自动投递助手</h3>
-            <div class="boss-auto-subtitle">拖动悬浮 · 屏蔽词 · 外包拦截 · 活跃Boss过滤</div>
+            <div class="boss-auto-subtitle">\u62d6\u52a8\u60ac\u6d6e \u00b7 \u5916\u5305\u62e6\u622a \u00b7 \u6d3b\u8dc3Boss\u8fc7\u6ee4</div>
           </div>
         </div>
         <div class="boss-auto-head-actions">
@@ -885,27 +1153,29 @@
         <div class="boss-auto-card">
           <div class="boss-auto-card-title">投递设置</div>
           <textarea id="boss-auto-apply-greeting" placeholder="投递成功后发送的招呼语模板。支持变量：{company}公司、{title}岗位、{salary}薪资、{area}地区"></textarea>
-          <textarea id="boss-auto-apply-block-keywords" placeholder="屏蔽词：命中公司名/职位名/地区等就跳过，支持换行、逗号、空格分隔。例如：外包 培训 销售 某某公司"></textarea>
           <textarea id="boss-auto-apply-foreign-keywords" placeholder="外企关键词：开启只投外企后，命中这些词才投递。用逗号分隔，例如：外企,欧美,Global,APAC,世界500强"></textarea>
           <div class="boss-auto-inline-actions"><button id="boss-auto-apply-reset-foreign" class="boss-auto-link-button" type="button">恢复默认外企关键词</button></div>
           <textarea id="boss-auto-apply-outsource-keywords" placeholder="外包拦截名单：开启外包拦截后，命中公司名/岗位信息就跳过。用逗号分隔，例如：中软国际,软通动力,文思海辉"></textarea>
           <div class="boss-auto-inline-actions"><button id="boss-auto-apply-reset-outsource" class="boss-auto-link-button" type="button">恢复默认外包名单</button></div>
-          <div class="boss-auto-controls boss-auto-controls-two">
+          <div class="boss-auto-controls">
             <div class="boss-auto-field"><label>最大投递数</label><input id="boss-auto-apply-max" type="number" min="1" max="200"></div>
             <div class="boss-auto-field"><label>间隔秒</label><input id="boss-auto-apply-interval" type="number" min="1" max="60"></div>
+            <div class="boss-auto-field"><label>Boss活跃天数</label><input id="boss-auto-apply-active-days" type="number" min="0" max="365"></div>
           </div>
           <div class="boss-auto-switches">
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-auto-greeting" type="checkbox"><span class="boss-auto-switch-ui"></span><span>智能招呼语</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-only-foreign" type="checkbox"><span class="boss-auto-switch-ui"></span><span>只投外企</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-block-outsource" type="checkbox"><span class="boss-auto-switch-ui"></span><span>外包拦截</span></label>
             <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-only-active" type="checkbox"><span class="boss-auto-switch-ui"></span><span>过滤不活跃Boss</span></label>
+            <label class="boss-auto-check boss-auto-switch"><input id="boss-auto-apply-skip-contacted" type="checkbox"><span class="boss-auto-switch-ui"></span><span>跳过历史沟通</span></label>
           </div>
-          <div class="boss-auto-tip">招呼语会按岗位自动替换 {company}/{title}/{salary}/{area}；开启“外包拦截”后会用外包名单匹配并跳过；开启“只投外企”后，未命中外企关键词会跳过。</div>
+          <div class="boss-auto-tip">\u5f00\u542f\u201c\u8fc7\u6ee4\u4e0d\u6d3b\u8dc3Boss\u201d\u540e\uff0c\u53ea\u6295\u9012\u6700\u8fd1\u6307\u5b9a\u5929\u6570\u5185\u6d3b\u8dc3\u7684 Boss\uff1b\u5f00\u542f\u201c\u8df3\u8fc7\u5386\u53f2\u6c9f\u901a\u201d\u540e\uff0c\u4f1a\u7528\u672c\u5730\u5386\u53f2\u548c\u9875\u9762\u804a\u5929\u72b6\u6001\u907f\u514d\u91cd\u590d\u6295\u9012\u3002</div>
         </div>
         <div class="boss-auto-card">
           <div class="boss-auto-actions">
             <button id="boss-auto-apply-toggle">开始投递</button>
             <button id="boss-auto-apply-scan">扫描当前页</button>
+            <button id="boss-auto-apply-clear-history" type="button">清空历史</button>
           </div>
         </div>
         <div class="boss-auto-card">
@@ -918,15 +1188,17 @@
     document.body.appendChild(panel);
 
     panel.querySelector('#boss-auto-apply-greeting').value = settings.greeting;
-    panel.querySelector('#boss-auto-apply-block-keywords').value = settings.blockKeywords || '';
     panel.querySelector('#boss-auto-apply-foreign-keywords').value = formatKeywords(settings.foreignKeywords || defaultSettings.foreignKeywords);
     panel.querySelector('#boss-auto-apply-outsource-keywords').value = formatKeywords(settings.outsourceKeywords || defaultSettings.outsourceKeywords);
     panel.querySelector('#boss-auto-apply-max').value = settings.maxApply;
     panel.querySelector('#boss-auto-apply-interval').value = settings.intervalSeconds;
+    panel.querySelector('#boss-auto-apply-active-days').value = settings.activeBossDays ?? defaultSettings.activeBossDays;
     panel.querySelector('#boss-auto-apply-auto-greeting').checked = settings.autoSendGreeting;
     panel.querySelector('#boss-auto-apply-only-foreign').checked = settings.onlyForeignCompany === true;
     panel.querySelector('#boss-auto-apply-block-outsource').checked = settings.blockOutsourceCompany === true;
     panel.querySelector('#boss-auto-apply-only-active').checked = settings.onlyActiveBoss === true;
+    panel.querySelector('#boss-auto-apply-skip-contacted').checked = settings.skipPreviouslyContacted !== false;
+    updateActiveDaysInputState();
 
     const collapseButton = panel.querySelector('#boss-auto-apply-collapse');
     const header = panel.querySelector('.boss-auto-header');
@@ -1052,6 +1324,10 @@
       const before = state.capturedJobs.size;
       scanDomJobs();
       log(`扫描完成，新增 ${state.capturedJobs.size - before} 个职位，当前共 ${state.capturedJobs.size} 个`, 'info');
+    });
+    panel.querySelector('#boss-auto-apply-clear-history').addEventListener('click', () => {
+      clearContactHistory();
+      log('已清空本地历史沟通记录。', 'success');
     });
 
     updateStatus();
