@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS自动投递助手（无AI）
 // @namespace    local.boss.auto.apply
-// @version      1.2.9
+// @version      1.2.11
 // @description  BOSS直聘自动投递：接口投递、自动下滑加载、外包拦截、过滤不活跃Boss；不含AI、不连接第三方服务。
 // @author       local
 // @match        https://www.zhipin.com/web/geek/*
@@ -17,6 +17,8 @@
   const CONTACT_HISTORY_KEY = 'boss_auto_apply_contact_history_v1';
   const CONTACT_HISTORY_MAX = 3000;
   const CONTACT_HISTORY_TTL = 1000 * 60 * 60 * 24 * 180;
+  const EMPTY_SCROLL_STOP_BATCHES = 3;
+  const FILTERED_EMPTY_SCROLL_STOP_BATCHES = 8;
   const END_REASONS = /上限|频繁|验证|安全|今日沟通人数|请稍后|风控|异常流量|登录/;
   const CONTACTED_REASONS = /继续沟通|已沟通|沟通过|已打招呼|已投递|已经.*沟通|已经.*打招呼/;
   const CONTACTED_BOOLEAN_FIELD_PATTERN = /^(?:is|has)?(?:friend|contact|contacted|communicated|greeted|greeting|conversation|chat)$/i;
@@ -35,6 +37,7 @@
     runId: 0,
     currentRunStartedAt: 0,
     emptyScrollBatches: 0,
+    lastFilteredSkipReason: '',
     stopReason: '',
   };
 
@@ -781,7 +784,11 @@
         return { contacted: true, reason: bossSignal, source: 'chat' };
       }
     } catch (error) {
-      return { contacted: false, warning: error.message };
+      const message = error?.message || '';
+      if (/非好友关系|不是好友|not\s+friend|non[-\s]?friend/i.test(message)) {
+        return { contacted: false };
+      }
+      return { contacted: false, warning: message };
     }
 
     return { contacted: false };
@@ -885,6 +892,7 @@
     state.capturedJobs.clear();
     state.scanned = 0;
     state.emptyScrollBatches = 0;
+    state.lastFilteredSkipReason = '';
     state.runId += 1;
     const runId = state.runId;
     const isCurrentRun = () => state.running && state.runId === runId;
@@ -892,7 +900,7 @@
     state.stopReason = '';
     updateStatus();
 
-    log('开始自动投递，已重置本轮扫描状态。请保持当前 BOSS 页面打开。', 'info');
+    log('\u5df2\u70b9\u51fb\u5f00\u59cb\u6295\u9012\uff0c\u6b63\u5728\u521d\u59cb\u5316\u672c\u8f6e\u6295\u9012\u3002\u8bf7\u4fdd\u6301\u5f53\u524d BOSS \u9875\u9762\u6253\u5f00\u3002', 'info');
     scanDomJobs();
 
     while (isCurrentRun() && state.success < settings.maxApply) {
@@ -912,11 +920,19 @@
 
       if (!job) {
         state.emptyScrollBatches += 1;
-        if (state.emptyScrollBatches >= 3) {
-          stop('连续下滑没有发现新的待投岗位，投递结束');
+        const emptyLimit = state.lastFilteredSkipReason ? FILTERED_EMPTY_SCROLL_STOP_BATCHES : EMPTY_SCROLL_STOP_BATCHES;
+        if (state.emptyScrollBatches >= emptyLimit) {
+          const reason = state.lastFilteredSkipReason
+            ? `连续下滑仍未找到新的可投岗位（最近跳过：${state.lastFilteredSkipReason}），投递结束`
+            : '连续下滑没有发现新的待投岗位，投递结束';
+          stop(reason);
           break;
         }
-        log('当前可见区域没有待投岗位，继续向下加载。', 'info');
+        if (state.lastFilteredSkipReason && state.emptyScrollBatches >= EMPTY_SCROLL_STOP_BATCHES) {
+          log(`刚才因${state.lastFilteredSkipReason}跳过岗位，继续向下加载寻找可投岗位。`, 'info');
+        } else {
+          log('当前可见区域没有待投岗位，继续向下加载。', 'info');
+        }
         await sleep(600);
         continue;
       }
@@ -928,6 +944,7 @@
       const outsourceKeyword = outsourceCompanyHit(job);
       if (outsourceKeyword) {
         state.skipped += 1;
+        state.lastFilteredSkipReason = '\u5916\u5305\u62e6\u622a';
         log(`跳过外包公司/外包岗位【${outsourceKeyword}】：${formatJob(job)}`, 'warn');
         updateStatus();
         continue;
@@ -936,6 +953,7 @@
       const foreignKeyword = foreignCompanyHit(job);
       if (settings.onlyForeignCompany && !foreignKeyword) {
         state.skipped += 1;
+        state.lastFilteredSkipReason = '\u975e\u5916\u4f01\u8fc7\u6ee4';
         log(`跳过非外企/未命中外企关键词：${formatJob(job)}`, 'warn');
         updateStatus();
         continue;
@@ -948,7 +966,8 @@
       if (!isCurrentRun()) break;
       if (contactedResult.contacted) {
         state.skipped += 1;
-        log(`\u8df3\u8fc7\u5386\u53f2\u5df2\u6c9f\u901a\u3010${contactedResult.reason}\u3011\uff1a${formatJob(job)}`, 'warn');
+        state.lastFilteredSkipReason = '\u5386\u53f2\u6c9f\u901a';
+        log(`\u8df3\u8fc7\u91cd\u590d\u5c97\u4f4d\u3010\u4e0a\u6b21\u8bb0\u5f55\uff1a${contactedResult.reason}\u3011\uff1a${formatJob(job)}`, 'warn');
         updateStatus();
         continue;
       }
@@ -961,12 +980,15 @@
         if (!isCurrentRun()) break;
         if (!activeResult.active) {
           state.skipped += 1;
+          state.lastFilteredSkipReason = 'Boss\u4e0d\u6d3b\u8dc3';
           log(`跳过不活跃Boss【${activeResult.text}】：${formatJob(job)}`, 'warn');
           updateStatus();
           continue;
         }
         log(`Boss近期活跃【${activeResult.text}】：${formatJob(job)}`, 'info');
       }
+
+      state.lastFilteredSkipReason = '';
 
       try {
         log(`投递中：${formatJob(job)}`, 'info');
@@ -986,6 +1008,7 @@
       } catch (error) {
         if (CONTACTED_REASONS.test(error.message)) {
           state.skipped += 1;
+          state.lastFilteredSkipReason = '\u5df2\u6c9f\u901a';
           rememberContactedJob(job, error.message);
           log(`投递返回已打招呼/已沟通，已跳过：${formatJob(job)}；原因：${error.message}`, 'warn');
           updateStatus();
@@ -1023,12 +1046,17 @@
   const updateStatus = () => {
     const status = document.querySelector('#boss-auto-apply-status');
     const toggle = document.querySelector('#boss-auto-apply-toggle');
+    const stopButton = document.querySelector('#boss-auto-apply-stop');
     if (status) {
-      status.textContent = `已下滑 ${state.scrollCount} 次｜捕获 ${state.capturedJobs.size}｜成功 ${state.success}/${settings.maxApply}｜失败 ${state.failed}｜跳过 ${state.skipped}`;
+      status.textContent = `\u5df2\u4e0b\u6ed1 ${state.scrollCount} \u6b21\uff5c\u6355\u83b7 ${state.capturedJobs.size}\uff5c\u6210\u529f ${state.success}/${settings.maxApply}\uff5c\u5931\u8d25 ${state.failed}\uff5c\u8df3\u8fc7 ${state.skipped}`;
     }
     if (toggle) {
-      toggle.textContent = state.running ? '停止投递' : '开始投递';
+      toggle.textContent = state.running ? '\u6295\u9012\u4e2d...' : '\u5f00\u59cb\u6295\u9012';
+      toggle.disabled = state.running;
       toggle.classList.toggle('running', state.running);
+    }
+    if (stopButton) {
+      stopButton.disabled = !state.running;
     }
   };
 
@@ -1118,12 +1146,14 @@
       #boss-auto-apply-panel .boss-auto-switch input:checked + .boss-auto-switch-ui::after { transform: translateX(16px); }
       #boss-auto-apply-panel .boss-auto-tip { margin-top: 7px; color: #7a8794; font-size: 12px; line-height: 1.45; }
       #boss-auto-apply-panel .boss-auto-actions { display: flex; gap: 9px; }
-      #boss-auto-apply-toggle, #boss-auto-apply-scan, #boss-auto-apply-clear-history { border: 0; border-radius: 11px; padding: 10px 14px; color: #fff; cursor: pointer; font-weight: 800; transition: transform .12s, box-shadow .12s, background .12s; }
+      #boss-auto-apply-toggle, #boss-auto-apply-stop, #boss-auto-apply-scan, #boss-auto-apply-clear-history { border: 0; border-radius: 11px; padding: 10px 14px; color: #fff; cursor: pointer; font-weight: 800; transition: transform .12s, box-shadow .12s, background .12s, opacity .12s; }
       #boss-auto-apply-toggle { flex: 1; background: #00b38a; box-shadow: 0 5px 14px rgba(0,179,138,.22); }
-      #boss-auto-apply-toggle.running { background: #e5484d; box-shadow: 0 5px 14px rgba(229,72,77,.22); }
+      #boss-auto-apply-toggle.running { background: #94a3b8; box-shadow: none; }
+      #boss-auto-apply-stop { background: #e5484d; box-shadow: 0 5px 14px rgba(229,72,77,.22); }
       #boss-auto-apply-scan { background: #3b82f6; box-shadow: 0 5px 14px rgba(59,130,246,.2); }
       #boss-auto-apply-clear-history { background: #64748b; box-shadow: 0 5px 14px rgba(100,116,139,.18); }
-      #boss-auto-apply-toggle:hover, #boss-auto-apply-scan:hover, #boss-auto-apply-clear-history:hover, #boss-auto-apply-panel .boss-auto-collapse:hover { transform: translateY(-1px); }
+      #boss-auto-apply-toggle:hover:not(:disabled), #boss-auto-apply-stop:hover:not(:disabled), #boss-auto-apply-scan:hover:not(:disabled), #boss-auto-apply-clear-history:hover:not(:disabled), #boss-auto-apply-panel .boss-auto-collapse:hover { transform: translateY(-1px); }
+      #boss-auto-apply-toggle:disabled, #boss-auto-apply-stop:disabled { background: #cbd5e1; box-shadow: none; cursor: not-allowed; opacity: .78; }
       #boss-auto-apply-log { height: 260px; overflow: auto; padding: 10px; border: 1px solid #edf2f7; border-radius: 11px; background: #fbfdff; }
       .boss-auto-apply-log-item { margin: 0 0 7px; line-height: 1.45; word-break: break-word; color: #405261; }
       .boss-auto-apply-log-item.success { color: #087f5b; }
@@ -1173,7 +1203,8 @@
         </div>
         <div class="boss-auto-card">
           <div class="boss-auto-actions">
-            <button id="boss-auto-apply-toggle">开始投递</button>
+            <button id="boss-auto-apply-toggle">\u5f00\u59cb\u6295\u9012</button>
+            <button id="boss-auto-apply-stop" type="button">\u505c\u6b62</button>
             <button id="boss-auto-apply-scan">扫描当前页</button>
             <button id="boss-auto-apply-clear-history" type="button">清空历史</button>
           </div>
@@ -1316,8 +1347,12 @@
     requestAnimationFrame(applySavedPosition);
     window.addEventListener('resize', () => clampPanelPosition(false));
     panel.querySelector('#boss-auto-apply-toggle').addEventListener('click', () => {
+      if (state.running) return;
       syncSettingsFromPanel();
-      if (state.running) stop('用户手动停止'); else run();
+      run();
+    });
+    panel.querySelector('#boss-auto-apply-stop').addEventListener('click', () => {
+      stop('\u7528\u6237\u624b\u52a8\u505c\u6b62');
     });
     panel.querySelector('#boss-auto-apply-scan').addEventListener('click', () => {
       syncSettingsFromPanel();
