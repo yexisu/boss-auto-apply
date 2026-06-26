@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Liepin Auto Apply Helper (No AI)
 // @namespace    local.liepin.auto.apply
-// @version      0.3.3
+// @version      0.3.4
 // @description  Liepin web auto apply helper: foreign-company filter, outsource blocking, HR active filter, history duplicate check. No AI.
 // @author       local
 // @match        https://www.liepin.com/*
@@ -158,11 +158,20 @@
   const saveSettings = () => localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
 
   const parseKeywords = (value) => String(value || '')
-    .split(/[\n,，;；|、\s]+/)
+    .split(/[\n,\uFF0C\u3001;\uFF1B\s]+/)
     .map((item) => item.trim())
     .filter(Boolean);
 
   const formatKeywords = (value) => parseKeywords(value).join(',');
+
+  const FORCE_OUTSOURCE_KEYWORDS = [
+    '\u5317\u4eac\u5916\u4f01\u5fb7\u79d1', '\u5916\u4f01\u5fb7\u79d1', '\u5fb7\u79d1\u4eba\u529b', '\u5fb7\u79d1', 'fesco adecco', 'adecco',
+    '\u8f6f\u901a\u52a8\u529b', '\u8f6f\u901a', '\u4e2d\u8f6f\u56fd\u9645', '\u4e2d\u8f6f', '\u535a\u5f66\u79d1\u6280', '\u535a\u5f66',
+    '\u6587\u601d\u6d77\u8f89', '\u4e1c\u8f6f', '\u4e2d\u79d1\u521b\u8fbe', '\u6cd5\u672c\u4fe1\u606f', '\u67ef\u83b1\u7279',
+    '\u5916\u5305', '\u5916\u6d3e', '\u9a7b\u573a', '\u6d3e\u9063', '\u4eba\u529b\u8d44\u6e90\u670d\u52a1', '\u4eba\u529b\u5916\u5305', '\u52b3\u52a1\u6d3e\u9063'
+  ];
+
+  const normalizeKeywordText = (value) => safeText(value).toLowerCase().replace(/[\s\u00b7\u30fb\u3002\uff08\uff09()\u3010\u3011\[\]\-_.]/g, '');
 
   const jobSearchText = (job) => [
     job && job.company,
@@ -184,10 +193,15 @@
 
   const outsourceCompanyHit = (job) => {
     if (!settings.blockOutsourceCompany) return null;
-    const keywords = parseKeywords(settings.outsourceKeywords || defaultSettings.outsourceKeywords);
+    const keywords = uniqueElements(FORCE_OUTSOURCE_KEYWORDS.concat(parseKeywords(settings.outsourceKeywords || defaultSettings.outsourceKeywords)));
     if (!keywords.length) return null;
     const target = jobSearchText(job);
-    return keywords.find((keyword) => target.includes(keyword.toLowerCase())) || null;
+    const normalizedTarget = normalizeKeywordText(target);
+    return keywords.find((keyword) => {
+      const rawKeyword = String(keyword || '').toLowerCase();
+      const normalizedKeyword = normalizeKeywordText(keyword);
+      return normalizedKeyword && (target.includes(rawKeyword) || normalizedTarget.includes(normalizedKeyword));
+    }) || null;
   };
 
   const safeJsonParse = (value) => {
@@ -820,7 +834,8 @@
     ], 80) || firstAnchorLine(anchor) || extractFieldByLines(card, 80, /\u516c\u53f8|\u6709\u9650|\d+-\d+|\u9762\u8bae/) || T.unknownJob;
     const company = pickTextBySelectors(card, [
       '[class*=company-name]', '[class*=companyName]', '[class*=comp-name]', '[class*=compName]',
-      '[class*=company-title]', '[class*=companyTitle]', '[class*=company] a', 'a[class*=company]', '[class*=recruiter-company]'
+      '[class*=company-title]', '[class*=companyTitle]', '[class*=company] a', 'a[class*=company]', '[class*=recruiter-company]',
+      'a[href*="company"]', 'a[href*="comp"]', '[class*=comp] a', '[class*=Comp] a', '[data-selector*="company"]'
     ], 80) || getLines(card).find((line) => line.length <= 80 && looksLikeCompany(line) && !looksLikeSalary(line) && !looksLikeArea(line)) || T.unknownCompany;
     const salary = pickTextBySelectors(card, [
       '[class*=salary]', '[class*=money]', '[class*=job-salary]', '[class*=jobSalary]'
